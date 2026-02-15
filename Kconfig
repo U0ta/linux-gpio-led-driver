@@ -1,0 +1,5 @@
+config MY_LED_DRIVER
+    bool "My Custom GPIO LED Driver (built-in)"
+    depends on OF && GPIOLIB
+    help
+      Simple LED driver
