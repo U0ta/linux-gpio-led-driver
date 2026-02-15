@@ -1,46 +1,79 @@
 #include <linux/version.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/platform_device.h> // platform_device, platform_driver
-#include <linux/of.h>             // Device Tree функции (of_*)
-#include <linux/of_gpio.h>        // of_get_named_gpio - парсинг GPIO из DT
-#include <linux/gpio.h>  
+#include <linux/platform_device.h>
+#include <linux/of.h>
+#include <linux/gpio/consumer.h>  
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/uaccess.h>
-#include <linux/string.h>
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Universal LED driver");
+MODULE_AUTHOR("Your Name");
 
 struct led_data {
-    int gpio;
+    struct gpio_desc *gpio_desc;  
     struct cdev cdev;
     dev_t devnum;
-    struct class *class; // класс устройства для udev
-    struct device *device; // объект устройства
+    struct class *class;
+    struct device *device;
 };
 
-// #define DEVICE_NAME "led"
 #define DEVICE_FIRST 0
 #define DEVICE_COUNT 1
 #define DGROUP_NAME "gpio_leds_custom"
-// #define BUF_SIZE 1024
-// #define EOK 0
 
+static int led_open(struct inode *n, struct file *f) {
+    printk(KERN_INFO "LED device opened\n");
+    return 0;
+}
 
-static int major = 0;
-// static struct cdev my_dev;
-static int device_open = 0;
-// static char kernel_buffer[BUF_SIZE];
-// static int buffer_len = 0;
+static int led_release(struct inode *n, struct file *f) {
+    printk(KERN_INFO "LED device closed\n");
+    return 0;
+}
 
-static int led_release(struct inode *n, struct file *f);
-static int led_open(struct inode *n, struct file *f);
-static ssize_t led_read(struct file *fp, char __user *buffer, size_t count, loff_t *ppos);
-static ssize_t led_write(struct file *fp, const char __user *buffer, size_t count, loff_t *ppos);
-static int __init led_probe(struct platform_device *pdev);
-static int __exit led_remove(struct platform_device *pdev);
+static ssize_t led_read(struct file *fp, char __user *buffer, size_t count, loff_t *ppos) {
+    struct led_data *led = container_of(fp->f_inode->i_cdev, 
+                                        struct led_data, cdev);
+    char val;
+    
+    if (*ppos > 0)
+        return 0;
+    
+    val = gpiod_get_value(led->gpio_desc) ? '1' : '0';
+    
+    if (copy_to_user(buffer, &val, 1))
+        return -EFAULT;
+    
+    *ppos = 1;
+    return 1;
+}
+
+static ssize_t led_write(struct file *fp, const char __user *buffer, size_t count, loff_t *ppos) {
+    struct led_data *led = container_of(fp->f_inode->i_cdev, 
+                                        struct led_data, cdev);
+    char val;
+    
+    if (count < 1)
+        return -EINVAL;
+    
+    if (get_user(val, buffer))
+        return -EFAULT;
+    
+    if (val == '1') {
+        gpiod_set_value(led->gpio_desc, 1); 
+        printk(KERN_INFO "LED ON\n");
+    } else if (val == '0') {
+        gpiod_set_value(led->gpio_desc, 0); 
+        printk(KERN_INFO "LED OFF\n");
+    } else {
+        return -EINVAL;
+    }
+    
+    return count;
+}
 
 static const struct file_operations led_fops = {
     .owner = THIS_MODULE,
@@ -50,72 +83,33 @@ static const struct file_operations led_fops = {
     .write = led_write,
 };
 
-static int led_open(struct inode *n, struct file *f) {
-    if (device_open) return -EBUSY;
-    device_open++;
-    return 0;
-}
-
-static int led_release(struct inode *n, struct file *f) {
-    device_open--;
-    return 0;
-}
-
-static ssize_t led_read(struct file *fp, char __user *buffer, size_t count, loff_t *ppos) {
-    struct led_data *led = container_of(fp->f_inode->i_cdev, 
-                                        struct led_data, cdev);
-
-    char val = gpio_get_value(led->gpio) ? '1' : '0';
-
-    if (copy_to_user(buffer, &val, count)) return -EFAULT;
-
-    return count;
-}
-
-static ssize_t led_write(struct file *fp, const char __user *buffer, size_t count, loff_t *ppos) {
-    // получаем указатель на структуру через объект (file), который является полем этой структуры
-    struct led_data *led = container_of(fp->f_inode->i_cdev, 
-                                        struct led_data, cdev);
-    
-                                    
-    char val;
-    if (get_user(val, buffer)) return -EFAULT;
-    gpio_set_value(led->gpio, (val == '1') ? 1 : 0);
-    return count;
-}
-
-static int __init led_probe(struct platform_device *pdev) {
-
-    printk(KERN_INFO "LED custom driver setting up...");
-
+static int led_probe(struct platform_device *pdev) {
     struct led_data *led;
     struct device *dev = &pdev->dev;
+    int result;
 
-    int result = 0;
+    printk(KERN_INFO "LED: Probing device\n");
 
     led = devm_kzalloc(dev, sizeof(*led), GFP_KERNEL);
-    if (!led) return -ENOMEM;
-    led->gpio = of_get_named_gpio(dev->of_node, "gpios", 0);
-    // обработка
-    if (!gpio_is_valid(led->gpio)) {
-        dev_err(dev, "Invalid GPIO\n");
-        return -EINVAL;
+    if (!led)
+        return -ENOMEM;
+    
+    // Получаем GPIO descriptor из Device Tree
+    // devm_gpiod_get() автоматически:
+    // 1. Применяет pinctrl настройки
+    // 2. Резервирует GPIO
+    // 3. Настраивает направление
+    led->gpio_desc = devm_gpiod_get(dev, "gpios", GPIOD_OUT_LOW);
+    if (IS_ERR(led->gpio_desc)) {
+        result = PTR_ERR(led->gpio_desc);
+        dev_err(dev, "Failed to get GPIO descriptor: %d\n", result);
+        return result;
     }
 
-    // бронь на пин
-    result = devm_gpio_request_one(dev, led->gpio, GPIOF_OUT_INIT_LOW, "led");
-
-
-    printk(KERN_INFO "Trying to register char device region\n");
-
-    result = alloc_chrdev_region(&led->devnum, DEVICE_FIRST, DEVICE_COUNT, DGROUP_NAME); // выделение региона под устройство, минусовой код = ошибка
-    major = MAJOR(led->devnum);
-    // printk(KERN_INFO "major number: %d\n", major);
-
+    result = alloc_chrdev_region(&led->devnum, DEVICE_FIRST, DEVICE_COUNT, DGROUP_NAME);
     if (result < 0) {
-        unregister_chrdev_region(MKDEV(major, DEVICE_FIRST), DEVICE_COUNT);
-        printk(KERN_INFO "Can not refister char device region\n");
-        goto err;
+        dev_err(dev, "Cannot register char device region\n");
+        return result;
     }
 
     cdev_init(&led->cdev, &led_fops);
@@ -123,62 +117,74 @@ static int __init led_probe(struct platform_device *pdev) {
 
     result = cdev_add(&led->cdev, led->devnum, DEVICE_COUNT);
     if (result < 0) {
-        unregister_chrdev_region(MKDEV(major, DEVICE_FIRST), DEVICE_COUNT);
-        printk(KERN_INFO "Can not add char device\n");
-        goto err;
+        unregister_chrdev_region(led->devnum, DEVICE_COUNT);
+        dev_err(dev, "Cannot add char device\n");
+        return result;
     }
 
-    // создание udev класса + обработка ошибок
-    #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-        led->class = class_create("led_class");
-    #else
-        led->class = class_create(THIS_MODULE, "led_class");
-    #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    led->class = class_create("myled_class");
+#else
+    led->class = class_create(THIS_MODULE, "myled_class");
+#endif
+    
     if (IS_ERR(led->class)) {
+        result = PTR_ERR(led->class);
         cdev_del(&led->cdev);
-        unregister_chrdev_region(MKDEV(major, DEVICE_FIRST), DEVICE_COUNT);
-        printk(KERN_INFO "Can not create udev class\n");
-        return PTR_ERR(led->class);
+        unregister_chrdev_region(led->devnum, DEVICE_COUNT);
+        dev_err(dev, "Cannot create class\n");
+        return result;
     }
-    // создание устройства + обработка ошибок
-    led->device = device_create(led->class, NULL, led->devnum, 
-                               NULL, "myled");
+
+    led->device = device_create(led->class, NULL, led->devnum, NULL, "myled");
     if (IS_ERR(led->device)) {
+        result = PTR_ERR(led->device);
         class_destroy(led->class);
         cdev_del(&led->cdev);
-        unregister_chrdev_region(led->devnum, 1);
-        return PTR_ERR(led->device);
+        unregister_chrdev_region(led->devnum, DEVICE_COUNT);
+        dev_err(dev, "Cannot create device\n");
+        return result;
     }
 
-err: 
-    return result;
+    platform_set_drvdata(pdev, led);
+
+    dev_info(dev, "LED driver ready: /dev/myled\n");
+    
+    return 0;
 }
 
-
-static int __exit led_remove(struct platform_device *pdev) {
+static int led_remove(struct platform_device *pdev) {
     struct led_data *led = platform_get_drvdata(pdev);
+
+    printk(KERN_INFO "LED: Removing device\n");
+
+    // Выключаем LED
+    gpiod_set_value(led->gpio_desc, 0); 
+
+    // GPIO автоматически освободится через devm_*
 
     device_destroy(led->class, led->devnum);
     class_destroy(led->class);
-    unregister_chrdev_region(MKDEV(major, DEVICE_FIRST), DEVICE_COUNT);
     cdev_del(&led->cdev);
-    printk(KERN_INFO "LED driver disabled");
+    unregister_chrdev_region(led->devnum, DEVICE_COUNT);
+
+    printk(KERN_INFO "LED driver removed\n");
+    
     return 0;
-}   
+}
 
 static const struct of_device_id led_of_match[] = {
     { .compatible = "custom,gpio-led"}, 
     { }
 };
-
 MODULE_DEVICE_TABLE(of, led_of_match);
 
 static struct platform_driver led_driver = {
-    .probe = led_probe,    // Вызывается когда найдено устройство
-    .remove = led_remove,  // Вызывается при удалении устройства
+    .probe = led_probe,
+    .remove = led_remove,
     .driver = {
-        .name = "gpio-led",           // Имя драйвера
-        .of_match_table = led_of_match, // Таблица соответствия DT
+        .name = "gpio-led",
+        .of_match_table = led_of_match,
     },
 };
 
